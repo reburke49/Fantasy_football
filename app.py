@@ -1,17 +1,51 @@
+# === Colab setup ===
+!pip -q install ortools pandas rapidfuzz ipywidgets
+
 import math
 import pandas as pd
-import streamlit as st
 from rapidfuzz import process, fuzz
 from ortools.linear_solver import pywraplp
+from google.colab import files
+import ipywidgets as w
+from IPython.display import display, clear_output
 
-st.set_page_config(page_title="Auction Draft Optimizer", layout="wide")
+# ============ Upload & load your data ============
+print("Please upload your CSV (must contain columns: Position, Player, Team, Points, VOR, AAV).")
+uploaded = files.upload()
+if not uploaded:
+    raise ValueError("No file uploaded.")
+CSV_PATH = list(uploaded.keys())[0]
+print(f"Loaded: {CSV_PATH}")
 
-# -------------------- Roster / Rules --------------------
-SLOTS = ["QB", "WR", "TE", "FLEX", "DEF", "K"]  # RB only eligible for FLEX (you already keep 2 RB + 1 WR)
-DEFAULT_BUDGET = 141
+# Read & clean
+df = pd.read_csv(CSV_PATH)
+expected_cols = ["Position", "Player", "Team", "Points", "VOR", "AAV"]
+missing = [c for c in expected_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"CSV missing required columns: {missing}")
 
-def eligible_slots_for_position(pos: str):
-    pos = str(pos).upper()
+for col in ["Points", "VOR", "AAV"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+df = df.dropna(subset=["VOR", "AAV"]).copy()
+
+# Normalize positions
+def norm_pos(p):
+    p = str(p).strip().upper()
+    mapping = {
+        "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
+        "K": "K", "PK": "K", "DST": "DEF", "D/ST": "DEF", "DEF": "DEF"
+    }
+    return mapping.get(p, p)
+
+df["Position"] = df["Position"].map(norm_pos)
+valid_pos = {"QB", "RB", "WR", "TE", "K", "DEF"}
+df = df[df["Position"].isin(valid_pos)].reset_index(drop=True)
+
+# ======== Optimizer ========
+SLOTS = ["QB", "WR", "TE", "FLEX", "DEF", "K"]   # keepers are 2 RB + 1 WR; RB only eligible for FLEX here
+
+def eligible_slots_for_position(pos):
     if pos == "QB":  return ["QB"]
     if pos == "WR":  return ["WR", "FLEX"]
     if pos == "TE":  return ["TE", "FLEX"]
@@ -20,32 +54,28 @@ def eligible_slots_for_position(pos: str):
     if pos == "DEF": return ["DEF"]
     return []
 
-def norm_pos(p):
-    p = str(p).strip().upper()
-    mapping = {"QB":"QB","RB":"RB","WR":"WR","TE":"TE","K":"K","PK":"K","DST":"DEF","D/ST":"DEF","DEF":"DEF"}
-    return mapping.get(p, p)
-
-# -------------------- Optimizer --------------------
 class DraftOptimizer:
-    def __init__(self, df: pd.DataFrame, budget=DEFAULT_BUDGET):
+    def __init__(self, df, budget=141):
         self.df_all = df.copy()
-        self.budget_start = int(budget)
-        self.budget_left = int(budget)
-        self.owned = {}      # name -> price
+        self.budget_start = int(budget)  # full cap for these 6 slots
+        self.budget_left = int(budget)   # live wallet
+        self.owned = {}                  # name -> price_paid
         self.gone = set()
         self.name_to_rows = {}
         for idx, row in self.df_all.iterrows():
             self.name_to_rows.setdefault(row["Player"], []).append(int(idx))
 
-        # Precompute ideal (max VOR under full 6-slot cap, no owned/gone)
-        ideal = self._solve_maxvor_tiebreak_minspend_internal(
+        # --- Compute "ideal" pre-draft ceiling VOR once (nobody owned/gone) ---
+        # This is the denominator for grades (Ideal = 100%)
+        ideal_sol = self._solve_maxvor_tiebreak_minspend_internal(
             candidates=self.df_all.copy().reset_index(drop=True),
-            force_owned=False, forced_player=None, forced_price=None
+            force_owned=False,               # ignore any owned at init
+            forced_player=None, forced_price=None
         )
-        self.ideal_vor = ideal["total_vor"] if ideal.get("ok") else None
+        self.ideal_vor = ideal_sol["total_vor"] if ideal_sol["ok"] else None
 
-    # ---- Helpers ----
-    def _match_name(self, name: str) -> str:
+    # ---- helpers ----
+    def _match_name(self, name):
         if name in self.name_to_rows:
             return name
         choices = list(self.name_to_rows.keys())
@@ -54,15 +84,18 @@ class DraftOptimizer:
             return match
         raise ValueError(f"Could not confidently match '{name}'. Closest was '{match}' ({score}).")
 
-    def gone_player(self, name: str):
+    def gone_player(self, name):
         n = self._match_name(name)
         if n in self.owned:
             return f"{n} already owned; not marking gone."
         self.gone.add(n)
         return f"Marked gone: {n}"
 
+    # ---------- CORE SOLVERS ----------
     def _candidates(self):
-        return self.df_all[~self.df_all["Player"].isin(self.gone)].copy().reset_index(drop=True)
+        mask = ~self.df_all["Player"].isin(self.gone)
+        c = self.df_all[mask].copy().reset_index(drop=True)
+        return c
 
     def _build_solver(self, candidates):
         solver = pywraplp.Solver.CreateSolver("CBC")
@@ -70,68 +103,75 @@ class DraftOptimizer:
             raise RuntimeError("Failed to create CBC solver.")
         x = {}
         for i, r in candidates.iterrows():
-            for slot in eligible_slots_for_position(r["Position"]):
+            pos = r["Position"]
+            for slot in eligible_slots_for_position(pos):
                 x[(i, slot)] = solver.BoolVar(f"x_{i}_{slot}")
-        # slot fill
+        # Each slot exactly 1 player
         for slot in SLOTS:
             solver.Add(sum(x[(i, slot)] for i, r in candidates.iterrows() if (i, slot) in x) == 1)
-        # player at most once
+        # Each player at most once
         for i, r in candidates.iterrows():
             solver.Add(sum(x[(i, slot)] for slot in SLOTS if (i, slot) in x) <= 1)
         return solver, x
 
-    def _force_owned_and_nominee(self, solver, x, candidates, forced_player=None, include_owned=True):
+    def _force_owned_and_optional_nominee(self, solver, x, candidates, forced_player=None, include_owned=True):
         name_to_idx = {}
         for i, r in candidates.iterrows():
             name_to_idx.setdefault(r["Player"], []).append(i)
-        # force owned
+
         if include_owned:
             for name in self.owned.keys():
                 if name in name_to_idx:
                     idxs = name_to_idx[name]
-                    solver.Add(sum(x[(i, s)] for i in idxs for s in SLOTS if (i, s) in x) == 1)
-        # force nominee
+                    solver.Add(sum(x[(i, slot)] for i in idxs for slot in SLOTS if (i, slot) in x) == 1)
+
         forced_index = None
         if forced_player is not None:
             fname = self._match_name(forced_player)
             if fname not in name_to_idx:
-                return None, f"{fname} not in candidates."
+                return None, f"Nominee {fname} not in candidate set."
             forced_index = name_to_idx[fname][0]
-            solver.Add(sum(x[(forced_index, s)] for s in SLOTS if (forced_index, s) in x) == 1)
+            solver.Add(sum(x[(forced_index, slot)] for slot in SLOTS if (forced_index, slot) in x) == 1)
         return forced_index, None
 
     def _price_used(self, i, row, forced_index, forced_price):
-        n = row["Player"]
+        name = row["Player"]
         if forced_index is not None and i == forced_index and forced_price is not None:
             return float(forced_price)
-        if n in self.owned:
-            return float(self.owned[n])
+        if name in self.owned:
+            return float(self.owned[name])
         return float(row["AAV"])
 
+    # ----- internal variants so we can compute the "ideal" ignoring owned/gone -----
     def _solve_maxvor_tiebreak_minspend_internal(self, candidates, force_owned=True, forced_player=None, forced_price=None):
-        if candidates.empty: return {"ok": False, "reason": "No candidates"}
+        if candidates.empty:
+            return {"ok": False, "reason": "No candidates available."}
+
         solver, x = self._build_solver(candidates)
-        forced_index, err = self._force_owned_and_nominee(solver, x, candidates, forced_player, include_owned=force_owned)
-        if err: return {"ok": False, "reason": err}
+        forced_index, err = self._force_owned_and_optional_nominee(
+            solver, x, candidates, forced_player=forced_player, include_owned=force_owned
+        )
+        if err:
+            return {"ok": False, "reason": err}
 
-        total_spend = solver.Sum(self._price_used(i, candidates.loc[i], forced_index, forced_price) * x[(i, s)]
-                                 for (i, s) in x)
-        solver.Add(total_spend <= float(self.budget_start))
-        total_vor = solver.Sum(float(candidates.loc[i, "VOR"]) * x[(i, s)] for (i, s) in x)
+        total_spend = solver.Sum(self._price_used(i, candidates.loc[i], forced_index, forced_price) *
+                                 x[(i, slot)] for (i, slot) in x)
+        solver.Add(total_spend <= float(self.budget_start))  # cap for these 6 slots
 
-        # Phase 1: max VOR
+        total_vor = solver.Sum(float(candidates.loc[i, "VOR"]) * x[(i, slot)] for (i, slot) in x)
         solver.Maximize(total_vor)
-        if solver.Solve() != pywraplp.Solver.OPTIMAL:
-            return {"ok": False, "reason": "No optimal VOR solution"}
-        best_vor = total_vor.solution_value()
+        s1 = solver.Solve()
+        if s1 != pywraplp.Solver.OPTIMAL:
+            return {"ok": False, "reason": "Infeasible or no optimal solution in phase 1."}
 
-        # Phase 2: min spend among max-VOR
+        best_vor = total_vor.solution_value()
         tiny = 1e-6
         solver.Add(total_vor >= best_vor - tiny)
         solver.Add(total_vor <= best_vor + tiny)
         solver.Minimize(total_spend)
-        if solver.Solve() != pywraplp.Solver.OPTIMAL:
-            return {"ok": False, "reason": "No min-spend tie-break"}
+        s2 = solver.Solve()
+        if s2 != pywraplp.Solver.OPTIMAL:
+            return {"ok": False, "reason": "No optimal tie-break solution."}
 
         chosen, tot_sp, owned_sp = [], 0.0, 0.0
         for (i, slot), var in x.items():
@@ -146,12 +186,53 @@ class DraftOptimizer:
                     "team": row.get("Team", ""), "vor": float(row["VOR"]),
                     "aav": float(row["AAV"]), "price_used": p
                 })
+
         return {
             "ok": True, "total_vor": best_vor, "total_spend": tot_sp,
             "owned_spend": owned_sp, "future_spend_needed": max(0.0, tot_sp - owned_sp),
             "lineup": sorted(chosen, key=lambda d: SLOTS.index(d["slot"]))
         }
 
+    def _solve_min_spend_any_vor_internal(self, candidates, force_owned=True, forced_player=None, forced_price=None):
+        if candidates.empty:
+            return {"ok": False, "reason": "No candidates available."}
+
+        solver, x = self._build_solver(candidates)
+        forced_index, err = self._force_owned_and_optional_nominee(
+            solver, x, candidates, forced_player=forced_player, include_owned=force_owned
+        )
+        if err:
+            return {"ok": False, "reason": err}
+
+        total_spend = solver.Sum(self._price_used(i, candidates.loc[i], forced_index, forced_price) *
+                                 x[(i, slot)] for (i, slot) in x)
+        solver.Add(total_spend <= float(self.budget_start))
+        solver.Minimize(total_spend)
+        s = solver.Solve()
+        if s != pywraplp.Solver.OPTIMAL:
+            return {"ok": False, "reason": "No feasible min-spend completion."}
+
+        chosen, tot_sp, owned_sp = [], 0.0, 0.0
+        for (i, slot), var in x.items():
+            if var.solution_value() > 0.5:
+                row = candidates.loc[i]
+                p = self._price_used(i, row, forced_index, forced_price)
+                tot_sp += p
+                if row["Player"] in self.owned and force_owned:
+                    owned_sp += p
+                chosen.append({
+                    "slot": slot, "name": row["Player"], "pos": row["Position"],
+                    "team": row.get("Team", ""), "vor": float(row["VOR"]),
+                    "aav": float(row["AAV"]), "price_used": p
+                })
+
+        return {
+            "ok": True, "total_spend": tot_sp, "owned_spend": owned_sp,
+            "future_spend_needed": max(0.0, tot_sp - owned_sp),
+            "lineup": sorted(chosen, key=lambda d: SLOTS.index(d["slot"]))
+        }
+
+    # Public wrappers under current constraints (owned/gone respected)
     def _solve_maxvor_tiebreak_minspend(self, forced_player=None, forced_price=None):
         return self._solve_maxvor_tiebreak_minspend_internal(
             candidates=self._candidates(), force_owned=True,
@@ -159,240 +240,282 @@ class DraftOptimizer:
         )
 
     def _solve_min_spend_any_vor(self, forced_player=None, forced_price=None):
-        c = self._candidates()
-        if c.empty: return {"ok": False}
-        solver, x = self._build_solver(c)
-        forced_index, err = self._force_owned_and_nominee(solver, x, c, forced_player, include_owned=True)
-        if err: return {"ok": False, "reason": err}
-        total_spend = solver.Sum(self._price_used(i, c.loc[i], forced_index, forced_price) * x[(i, s)]
-                                 for (i, s) in x)
-        solver.Add(total_spend <= float(self.budget_start))
-        solver.Minimize(total_spend)
-        if solver.Solve() != pywraplp.Solver.OPTIMAL:
-            return {"ok": False}
-        chosen, tot_sp, owned_sp = [], 0.0, 0.0
-        for (i, slot), var in x.items():
-            if var.solution_value() > 0.5:
-                row = c.loc[i]
-                p = self._price_used(i, row, forced_index, forced_price)
-                tot_sp += p
-                if row["Player"] in self.owned:
-                    owned_sp += p
-                chosen.append({
-                    "slot": slot, "name": row["Player"], "pos": row["Position"],
-                    "team": row.get("Team", ""), "vor": float(row["VOR"]),
-                    "aav": float(row["AAV"]), "price_used": p
-                })
-        return {"ok": True, "total_spend": tot_sp, "owned_spend": owned_sp,
-                "future_spend_needed": max(0.0, tot_sp - owned_sp), "lineup": chosen}
+        return self._solve_min_spend_any_vor_internal(
+            candidates=self._candidates(), force_owned=True,
+            forced_player=forced_player, forced_price=forced_price
+        )
 
+    def best_lineup(self):
+        return self._solve_maxvor_tiebreak_minspend()
+
+    # ---- Grading helpers ----
     def _grade(self, vor):
         if self.ideal_vor and self.ideal_vor > 0:
             return 100.0 * float(vor) / float(self.ideal_vor)
         return None
 
+    # VOR-based cap intersected with affordability cap + grades
     def compute_threshold(self, name):
         n = self._match_name(name)
-        base = self._solve_maxvor_tiebreak_minspend()
-        if not base.get("ok"): return {"ok": False, "reason": base.get("reason")}
-        base_vor = base["total_vor"]
 
-        trial = self._solve_maxvor_tiebreak_minspend(forced_player=n, forced_price=1)
-        if (not trial.get("ok")) or (trial["total_vor"] + 1e-6 < base_vor):
-            vor_cap, with_lineup = 0, None
+        # VOR-preserving threshold
+        base = self._solve_maxvor_tiebreak_minspend()
+        if not base["ok"]:
+            return {"ok": False, "reason": base.get("reason", "No baseline solution.")}
+
+        base_vor = base["total_vor"]
+        trial1 = self._solve_maxvor_tiebreak_minspend(forced_player=n, forced_price=1)
+        if not trial1["ok"] or trial1["total_vor"] + 1e-6 < base_vor:
+            vor_cap = 0
+            with_lineup = None
         else:
-            lo, hi = 1, int(self.budget_left)
-            vor_cap, with_lineup = lo, trial
+            lo, hi = 1, int(self.budget_left)  # never recommend beyond wallet
+            vor_cap, with_lineup = lo, trial1
             while lo <= hi:
                 mid = (lo + hi) // 2
                 t = self._solve_maxvor_tiebreak_minspend(forced_player=n, forced_price=mid)
-                if t.get("ok") and t["total_vor"] + 1e-6 >= base_vor:
+                if t["ok"] and t["total_vor"] + 1e-6 >= base_vor:
                     vor_cap, with_lineup = mid, t
                     lo = mid + 1
                 else:
                     hi = mid - 1
 
+        # Affordability cap
         minfill = self._solve_min_spend_any_vor(forced_player=n, forced_price=1)
-        if not minfill.get("ok"):
+        if not minfill["ok"]:
             afford_cap = 0
         else:
             need = math.ceil(minfill["future_spend_needed"])
             afford_cap = max(0, int(self.budget_left - need))
 
         final_cap = min(vor_cap, afford_cap)
+
+        # --- Grades ---
+        baseline_grade = self._grade(base["total_vor"])
+        with_grade = self._grade(with_lineup["total_vor"]) if with_lineup else None
+
         return {
-            "ok": True, "player": n, "max_bid": final_cap,
-            "vor_cap": vor_cap, "afford_cap": afford_cap,
-            "baseline": base, "with_lineup": with_lineup,
-            "baseline_grade": self._grade(base["total_vor"]),
-            "with_grade": self._grade(with_lineup["total_vor"]) if with_lineup else None,
+            "ok": True, "player": n,
+            "max_bid": final_cap, "vor_cap": vor_cap, "afford_cap": afford_cap,
+            "baseline": base, "with_lineup": with_lineup if final_cap > 0 else None,
+            "baseline_grade": baseline_grade, "with_grade": with_grade,
             "ideal_vor": self.ideal_vor
         }
 
-    def zero_chance_players(self):
-        base = self._solve_maxvor_tiebreak_minspend()
-        if not base.get("ok"): return []
-        base_vor = base["total_vor"]
-        tiny = 1e-6
-        cands = self._candidates()
-        names = sorted(cands["Player"].unique().tolist())
-        zero = []
-        for n in names:
-            t = self._solve_maxvor_tiebreak_minspend(forced_player=n, forced_price=1)
-            if (not t.get("ok")) or (t["total_vor"] + tiny < base_vor):
-                zero.append(n)
-        return zero
-
+    # ---- Buy with affordability guard ----
     def buy(self, name, price):
         n = self._match_name(name)
         price = int(price)
+
+        # Affordability check BEFORE committing
         minfill = self._solve_min_spend_any_vor(forced_player=n, forced_price=1)
-        if not minfill.get("ok"):
-            return f"Cannot buy {n}: no feasible completion."
+        if not minfill["ok"]:
+            return f"Cannot buy {n}: no feasible way to complete roster under the cap."
         need = math.ceil(minfill["future_spend_needed"])
-        max_aff = max(0, int(self.budget_left - need))
-        if price > max_aff:
-            return (f"Blocked: ${price} leaves ${self.budget_left - price}, "
-                    f"need at least ${need} to fill remaining slots. Max: ${max_aff}.")
-        if n in self.gone: self.gone.remove(n)
+        max_affordable = max(0, int(self.budget_left - need))
+        if price > max_affordable:
+            return (f"Blocked: Buying {n} at ${price} would leave only ${self.budget_left - price}, "
+                    f"but you need at least ${need} to fill the remaining slots. "
+                    f"Max you can pay: ${max_affordable}.")
+
+        # Commit the purchase
+        if n in self.gone:
+            self.gone.remove(n)
         prev = self.owned.get(n)
-        if prev is not None: self.budget_left += prev
+        if prev is not None:
+            self.budget_left += prev
         self.owned[n] = price
         self.budget_left -= price
-        return f"Added {n} for ${price}. Budget left: ${self.budget_left}"
+        msg = f"Added {n} for ${price}. Budget left: ${self.budget_left}"
+        if self.budget_left < 0:
+            msg += "  (Warning: budget negative)"
+        return msg
 
-# -------------------- UI --------------------
-st.title("Auction Draft Optimizer (VOR)")
+# Helper: table formatting
+def sol_to_df(sol):
+    if not sol or not sol.get("ok"):
+        return pd.DataFrame()
+    rows = []
+    for r in sol["lineup"]:
+        rows.append({
+            "Slot": r["slot"],
+            "Player": r["name"],
+            "Pos": r["pos"],
+            "Team": r["team"],
+            "VOR": round(r["vor"], 2),
+            "PriceUsed": int(round(r["price_used"])),
+            "AAV": int(round(r["aav"]))
+        })
+    order = {s:i for i,s in enumerate(SLOTS)}
+    out = pd.DataFrame(rows).sort_values("Slot", key=lambda s: s.map(order))
+    out.index = range(1, len(out)+1)
+    return out
 
-st.sidebar.header("1) Upload CSV")
-uploaded = st.sidebar.file_uploader("Columns: Position, Player, Team, Points, VOR, AAV", type=["csv"])
-budget = st.sidebar.number_input("Budget for these 6 slots", min_value=1, value=DEFAULT_BUDGET, step=1)
+# ==========================
+# Create optimizer
+# ==========================
+opt = DraftOptimizer(df, budget=141)
 
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-    # Basic validation/clean
-    for c in ["Points","VOR","AAV"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["VOR","AAV"]).copy()
-    df["Position"] = df["Position"].map(norm_pos)
-    df = df[df["Position"].isin({"QB","RB","WR","TE","K","DEF"})].reset_index(drop=True)
+# ==========================
+# UI (per-position dropdowns)
+# ==========================
+hide_gone_owned = w.Checkbox(value=True, description="Hide owned/gone")
+show_lineups = w.Checkbox(value=False, description="Show details")
 
-    # Create optimizer once per new file/budget
-    if "opt" not in st.session_state or st.session_state.get("last_budget") != budget or st.session_state.get("last_file") != uploaded.name:
-        st.session_state.opt = DraftOptimizer(df, budget=budget)
-        st.session_state.last_budget = budget
-        st.session_state.last_file = uploaded.name
+SENTINEL = ("— Select —", "")
+def options_for_pos(pos):
+    d = df[df["Position"] == pos]
+    if hide_gone_owned.value:
+        d = d[~d["Player"].isin(opt.gone)]
+        d = d[~d["Player"].isin(opt.owned.keys())]
+    names = sorted(d["Player"].unique().tolist())
+    return [SENTINEL] + [(n, n) for n in names]
 
-    opt: DraftOptimizer = st.session_state.opt
+dq  = w.Dropdown(options=options_for_pos("QB"),  description="QB:")
+drb = w.Dropdown(options=options_for_pos("RB"),  description="RB:")
+dwr = w.Dropdown(options=options_for_pos("WR"),  description="WR:")
+dte = w.Dropdown(options=options_for_pos("TE"),  description="TE:")
+dk  = w.Dropdown(options=options_for_pos("K"),   description="K:")
+ddef= w.Dropdown(options=options_for_pos("DEF"), description="DEF:")
 
-    st.sidebar.header("2) Controls")
-    hide_gone_owned = st.sidebar.checkbox("Hide owned/gone in pickers", value=True)
-    show_details = st.sidebar.checkbox("Show lineups & grades", value=False)
+reco_label = w.HTML("<b>Bid up to:</b> —")
+caps_label = w.HTML("")   # shows (VOR cap vs Afford cap) when details on
+grade_label = w.HTML("Grades: —")  # NEW: percentage grades vs ideal ceiling
+buy_price = w.Text(value="", placeholder="Won @ $", description="Won @ $:")
+buy_btn = w.Button(description="Buy", button_style="success")
+gone_btn = w.Button(description="Gone", button_style="warning")
+output = w.Output()
 
-    # Per-position pickers (with auto-clear)
-    def options_for_pos(pos):
-        d = df[df["Position"] == pos]
-        if hide_gone_owned:
-            d = d[~d["Player"].isin(opt.gone)]
-            d = d[~d["Player"].isin(opt.owned.keys())]
-        names = ["— Select —"] + sorted(d["Player"].unique().tolist())
-        return names
+def budget_html():
+    return f"<b>Budget left:</b> ${opt.budget_left} &nbsp;|&nbsp; <b>Total cap (6 slots):</b> ${opt.budget_start}"
 
-    def clear_others(keep_key):
-        for key in ["sel_QB","sel_RB","sel_WR","sel_TE","sel_K","sel_DEF"]:
-            if key != keep_key:
-                st.session_state[key] = "— Select —"
+budget_label = w.HTML(budget_html())
 
-    cols1 = st.columns(3)
-    cols2 = st.columns(3)
+def refresh_all_dropdowns(_=None):
+    dq.options   = options_for_pos("QB")
+    drb.options  = options_for_pos("RB")
+    dwr.options  = options_for_pos("WR")
+    dte.options  = options_for_pos("TE")
+    dk.options   = options_for_pos("K")
+    ddef.options = options_for_pos("DEF")
 
-    sel_QB = cols1[0].selectbox("QB", options_for_pos("QB"), key="sel_QB", index=0,
-                                on_change=lambda: clear_others("sel_QB"))
-    sel_RB = cols1[1].selectbox("RB (FLEX)", options_for_pos("RB"), key="sel_RB", index=0,
-                                on_change=lambda: clear_others("sel_RB"))
-    sel_WR = cols1[2].selectbox("WR", options_for_pos("WR"), key="sel_WR", index=0,
-                                on_change=lambda: clear_others("sel_WR"))
-    sel_TE = cols2[0].selectbox("TE", options_for_pos("TE"), key="sel_TE", index=0,
-                                on_change=lambda: clear_others("sel_TE"))
-    sel_K  = cols2[1].selectbox("K",  options_for_pos("K"),  key="sel_K", index=0,
-                                on_change=lambda: clear_others("sel_K"))
-    sel_D  = cols2[2].selectbox("DEF", options_for_pos("DEF"), key="sel_DEF", index=0,
-                                on_change=lambda: clear_others("sel_DEF"))
+hide_gone_owned.observe(refresh_all_dropdowns, names="value")
 
-    def get_selected_player():
-        for key in ["sel_QB","sel_RB","sel_WR","sel_TE","sel_K","sel_DEF"]:
-            val = st.session_state.get(key, "— Select —")
-            if val and val != "— Select —":
-                return val
-        return None
+def get_selected_player():
+    for dd in (dq, drb, dwr, dte, dk, ddef):
+        if dd.value:
+            return dd.value
+    return ""
 
-    st.markdown(f"**Budget left:** ${opt.budget_left} &nbsp;&nbsp;|&nbsp;&nbsp; **Total cap (6 slots):** ${opt.budget_start}")
+def clear_others(except_dd):
+    for dd in (dq, drb, dwr, dte, dk, ddef):
+        if dd is not except_dd:
+            dd.value = ""  # sentinel
 
-    nominee = get_selected_player()
-    reco_col, caps_col, grade_col = st.columns([1,1,2])
+def fmt_pct(x):
+    return "—" if x is None else f"{x:.1f}%"
 
-    if nominee:
-        res = opt.compute_threshold(nominee)
-        if not res.get("ok"):
-            reco_col.error("No solution")
-        else:
-            reco_col.metric("Bid up to", f"${res['max_bid']}")
-            if show_details:
-                caps_col.write(f"VOR cap: **${res['vor_cap']}**  |  Afford cap: **${res['afford_cap']}**")
-                def fmt(x): return "—" if x is None else f"{x:.1f}%"
-                grade_col.write(f"**Grades:** Fallback {fmt(res['baseline_grade'])} | With {fmt(res['with_grade'])} | Ideal 100%")
+def update_recommendation(*args):
+    player = get_selected_player()
+    caps_label.value = ""
+    if not player:
+        reco_label.value = "<b>Bid up to:</b> —"
+        grade_label.value = "Grades: —"
+        with output:
+            clear_output(wait=True)
+        return
+    res = opt.compute_threshold(player)
+    if not res["ok"]:
+        reco_label.value = "<b>Bid up to:</b> (no solution)"
+        grade_label.value = "Grades: —"
+        with output:
+            clear_output(wait=True)
+            print(res.get("reason", "No solution."))
+        return
+    reco_label.value = f"<b>Bid up to:</b> ${res['max_bid']}"
+    if show_lineups.value:
+        caps_label.value = f"(VOR cap: ${res['vor_cap']}, Afford cap: ${res['afford_cap']})"
 
-            if show_details:
-                st.subheader("Fallback lineup (without nominee)")
-                fb = pd.DataFrame(res["baseline"]["lineup"])
-                st.dataframe(fb[["slot","name","pos","team","vor","price_used","aav"]].rename(columns={
-                    "slot":"Slot","name":"Player","pos":"Pos","team":"Team","vor":"VOR","price_used":"PriceUsed","aav":"AAV"
-                }), use_container_width=True)
+    # NEW: Grades display
+    grade_label.value = (
+        f"Grades: Fallback {fmt_pct(res.get('baseline_grade'))} | "
+        f"With {fmt_pct(res.get('with_grade'))} | "
+        f"Ideal 100%"
+    )
 
-                if res["with_lineup"]:
-                    st.subheader(f"Best lineup WITH {res['player']} at ${res['max_bid']}")
-                    wl = pd.DataFrame(res["with_lineup"]["lineup"])
-                    st.dataframe(wl[["slot","name","pos","team","vor","price_used","aav"]].rename(columns={
-                        "slot":"Slot","name":"Player","pos":"Pos","team":"Team","vor":"VOR","price_used":"PriceUsed","aav":"AAV"
-                    }), use_container_width=True)
+    with output:
+        clear_output(wait=True)
+        if show_lineups.value:
+            print("Fallback lineup (without nominee):")
+            display(sol_to_df(res["baseline"]))
+            if res["with_lineup"]:
+                print(f"\nBest lineup WITH {res['player']} at ${res['max_bid']}:")
+                display(sol_to_df(res["with_lineup"]))
+    budget_label.value = budget_html()
 
-    st.divider()
-    st.subheader("Buy / Gone")
-    c1, c2, c3 = st.columns([1,1,2])
-    win_price = c1.number_input("Won @ $", min_value=1, step=1, value=1)
-    if c2.button("Buy"):
-        if not nominee:
-            st.warning("Pick a player first.")
-        else:
-            msg = opt.buy(nominee, int(win_price))
-            st.write(msg)
-    if c3.button("Gone"):
-        if not nominee:
-            st.warning("Pick a player first.")
-        else:
-            st.write(opt.gone_player(nominee))
+def on_dd_change(change, dd):
+    if change["name"] == "value":
+        if dd.value:
+            clear_others(dd)
+        update_recommendation()
 
-    if show_details:
-        st.subheader("Best lineup now")
-        best = opt._solve_maxvor_tiebreak_minspend()
-        if best.get("ok"):
-            now = pd.DataFrame(best["lineup"])
-            st.dataframe(now[["slot","name","pos","team","vor","price_used","aav"]].rename(columns={
-                "slot":"Slot","name":"Player","pos":"Pos","team":"Team","vor":"VOR","price_used":"PriceUsed","aav":"AAV"
-            }), use_container_width=True)
+for dd in (dq, drb, dwr, dte, dk, ddef):
+    dd.observe(lambda ch, d=dd: on_dd_change(ch, d), names="value")
+
+def on_buy_clicked(_):
+    player = get_selected_player()
+    val = buy_price.value.strip()
+    with output:
+        clear_output(wait=True)
+        if not player:
+            print("Pick a player first.")
+            return
+        if not val.isdigit():
+            print("Enter a whole-dollar amount in 'Won @ $'.")
+            return
+        # Try to buy (will block if unaffordable)
+        msg = opt.buy(player, int(val))
+        print(msg)
+        if msg.startswith("Blocked:"):
+            return
+        # Successful buy:
+        best = opt.best_lineup()
+        if best and best.get("ok") and show_lineups.value:
             grade_now = opt._grade(best["total_vor"])
-            st.caption(f"Grade now: {('—' if grade_now is None else f'{grade_now:.1f}%')} of ideal")
+            print(f"\nBest lineup now (Grade: {fmt_pct(grade_now)} of ideal):")
+            display(sol_to_df(best))
+    buy_price.value = ""
+    budget_label.value = budget_html()
+    refresh_all_dropdowns()
+    dq.value = drb.value = dwr.value = dte.value = dk.value = ddef.value = ""
+    update_recommendation()
 
-    st.divider()
-    st.subheader("Zero-chance players (cannot be in any max-VOR roster even at $1)")
-    if st.button("Recompute zero-chance"):
-        pass  # no-op; forces rerun
+def on_gone_clicked(_):
+    player = get_selected_player()
+    with output:
+        clear_output(wait=True)
+        if not player:
+            print("Pick a player first.")
+            return
+        msg = opt.gone_player(player)
+        print(msg)
+    refresh_all_dropdowns()
+    dq.value = drb.value = dwr.value = dte.value = dk.value = ddef.value = ""
+    update_recommendation()
 
-    zero = opt.zero_chance_players()
-    zero_df = (df[df["Player"].isin(zero)][["Player","Position","Team","VOR","AAV"]]
-               .sort_values(["Position","VOR"], ascending=[True, False]).reset_index(drop=True))
-    st.write(f"Count: **{len(zero_df)}**")
-    st.dataframe(zero_df, use_container_width=True)
+buy_btn.on_click(on_buy_clicked)
+gone_btn.on_click(on_gone_clicked)
 
-else:
-    st.info("Upload your CSV to begin.")
+# Layout
+row1 = w.HBox([hide_gone_owned, show_lineups, budget_label])
+row2 = w.HBox([dq, drb, dwr])
+row3 = w.HBox([dte, dk, ddef])
+row4 = w.HBox([reco_label, caps_label, w.HTML("&nbsp;&nbsp;&nbsp;"), buy_price, buy_btn, gone_btn])
+row5 = w.HBox([grade_label])  # NEW: grades row
+
+refresh_all_dropdowns()
+display(w.VBox([row1, row2, row3, row4, row5, output]))
+
+print("Pick the nominated player from ONE position dropdown; others clear automatically.")
+print("The 'Bid up to' is the lower of VOR-threshold and affordability.")
+print("Grades compare lineups' VOR to your pre-draft ideal (best possible under $141 for these 6 slots).")
