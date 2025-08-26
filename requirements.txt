@@ -1,0 +1,5 @@
+streamlit
+pandas
+rapidfuzz
+ortools
+protobuf>=5.26.1,<6.0.0
